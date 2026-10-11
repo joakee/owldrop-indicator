@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""owldrop-indicator: a desktop-agnostic tray menu for AirDrop, driving omdrop.
+
+The indicator holds no AirDrop state of its own. Like omdrop's Omarchy panel,
+it runs the `omdrop` command for every action and draws what
+`omdrop status --json` says, so it stays right when something else (the
+command line, the window's timer) changes things underneath it.
+
+Received files are announced by following the receiver's log, the same lines
+`omdrop watch` reads, because omdrop's own notifications go through Omarchy's
+notifier and do not appear on other desktops.
+"""
+
+import json
+import os
+import shutil
+import signal
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Notify", "0.7")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator
+from gi.repository import Gio, GLib, Gtk, Notify  # noqa: E402
+
+APP_ID = "owldrop-indicator"
+RECEIVER_UNIT = "airdrop-receiver.service"
+INSTALL_URL = "https://github.com/t4t5/omdrop-plugin"
+
+# What "Stay visible for" offers, as `omdrop on` spells each one.
+DURATIONS = [
+    ("once", "Until one file arrives"),
+    ("10m", "10 minutes"),
+    ("30m", "30 minutes"),
+    ("1h", "1 hour"),
+    ("forever", "Until turned off"),
+]
+
+POLL_ON_S = 2      # status while receiving: the countdown and visibility move
+POLL_OFF_S = 10    # status while off: only someone else turning it on changes it
+PEERS_S = 5        # passive peer listing while visible; transmits nothing
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), APP_ID)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.ini")
+
+
+def find_cli():
+    """The omdrop command: $OWLDROP_CLI, else PATH, else where `omdrop setup` links it."""
+    for cand in (os.environ.get("OWLDROP_CLI"), shutil.which("omdrop"),
+                 os.path.expanduser("~/.local/bin/omdrop")):
+        if cand and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def tildify(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
+def clock(secs):
+    secs = max(0, int(secs))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def last_line(text):
+    """The sentence worth showing from a failed command's stderr."""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    msg = lines[-1]
+    return msg[len("omdrop: "):] if msg.startswith("omdrop: ") else msg
+
+
+class Settings:
+    """The indicator's own preferences; omdrop keeps everything else."""
+
+    def __init__(self):
+        self.kf = GLib.KeyFile()
+        try:
+            self.kf.load_from_file(CONFIG_FILE, GLib.KeyFileFlags.NONE)
+        except GLib.Error:
+            pass
+
+    def get(self, key, default):
+        try:
+            return self.kf.get_string("indicator", key)
+        except GLib.Error:
+            return default
+
+    def set(self, key, value):
+        self.kf.set_string("indicator", key, value)
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            self.kf.save_to_file(CONFIG_FILE)
+        except (OSError, GLib.Error) as e:
+            print(f"{APP_ID}: could not save settings: {e}", file=sys.stderr)
+
+
+class Command:
+    """One run of omdrop (or anything else), asynchronous, never blocking the menu."""
+
+    def __init__(self, argv, done=None, on_line=None):
+        self.done = done
+        self.proc = None
+        flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        try:
+            self.proc = Gio.Subprocess.new(argv, flags)
+        except GLib.Error as e:
+            GLib.idle_add(self._finish, 127, "", e.message)
+            return
+        if on_line is None:
+            self.proc.communicate_utf8_async(None, None, self._communicated)
+        else:
+            # Streamed: each stdout line as it arrives, stderr collected for the end.
+            self.on_line = on_line
+            self.err = []
+            self.out = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+            self.errs = Gio.DataInputStream.new(self.proc.get_stderr_pipe())
+            self.out.read_line_async(GLib.PRIORITY_DEFAULT, None, self._got_line)
+            self.errs.read_line_async(GLib.PRIORITY_DEFAULT, None, self._got_err)
+
+    def _got_line(self, stream, res):
+        try:
+            line, _ = stream.read_line_finish_utf8(res)
+        except GLib.Error:
+            line = None
+        if line is None:
+            self.proc.wait_async(None, self._waited)
+            return
+        self.on_line(line)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._got_line)
+
+    def _got_err(self, stream, res):
+        try:
+            line, _ = stream.read_line_finish_utf8(res)
+        except GLib.Error:
+            line = None
+        if line is not None:
+            self.err.append(line)
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._got_err)
+
+    def _waited(self, proc, res):
+        try:
+            proc.wait_finish(res)
+        except GLib.Error:
+            pass
+        self._finish(self._status(), "", "\n".join(self.err))
+
+    def _communicated(self, proc, res):
+        try:
+            _, out, err = proc.communicate_utf8_finish(res)
+        except GLib.Error as e:
+            out, err = "", e.message
+        self._finish(self._status(), out or "", err or "")
+
+    def _status(self):
+        if self.proc.get_if_exited():
+            return self.proc.get_exit_status()
+        return -1
+
+    def _finish(self, rc, out, err):
+        if self.done:
+            self.done(rc, out, err)
+        return False
+
+    def stop(self):
+        # omdrop runs lookups and sends in their own process group and stops
+        # them on TERM, so the sender and its Bluetooth advert go with it.
+        if self.proc:
+            self.proc.send_signal(signal.SIGTERM)
+
+
+class Indicator:
+    def __init__(self):
+        self.cli = find_cli()
+        self.settings = Settings()
+        self.status = None          # last `omdrop status --json`
+        self.status_at = 0          # monotonic seconds it was read at
+        self.doctor = None          # last `omdrop doctor --json`
+        self.busy = None            # "Turning on…" and the like, while a command runs
+        self.peers = {}             # mac -> {"mac", "rssi", "name"}
+        self.names = {}             # mac -> name, kept across listings this session
+        self.lookup = None          # running `peers -n --stream`
+        self.sends = {}             # mac -> running send Command
+        self.status_cmd = None
+        self.peers_cmd = None
+        self.journal = None
+        self.notes = set()          # notifications kept alive so their actions work
+        self.updating = False       # set while syncing widgets to state, so handlers stay quiet
+        self.poll_id = 0
+
+        self.ind = AppIndicator.Indicator.new(
+            APP_ID, "owldrop-indicator-off",
+            AppIndicator.IndicatorCategory.COMMUNICATIONS)
+        here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
+        if os.path.isdir(here):
+            self.ind.set_icon_theme_path(here)
+        self.ind.set_title("AirDrop")
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+        self.build_menu()
+        self.ind.set_menu(self.menu)
+        # Middle-click on the icon toggles receiving, as it mutes in the
+        # volume applets.
+        self.ind.set_secondary_activate_target(self.toggle_item)
+
+        if self.cli:
+            self.refresh_status()
+            self.refresh_doctor()
+            self.follow_receiver()
+        self.render()
+        GLib.timeout_add_seconds(1, self.tick)
+
+    # ------------------------------------------------------------------ menu
+
+    def build_menu(self):
+        m = self.menu = Gtk.Menu()
+
+        self.header = Gtk.MenuItem(label="AirDrop")
+        self.header.set_sensitive(False)
+        m.append(self.header)
+        self.detail = Gtk.MenuItem(label="")
+        self.detail.set_sensitive(False)
+        m.append(self.detail)
+
+        self.toggle_item = Gtk.CheckMenuItem(label="Receive files")
+        self.toggle_item.connect("toggled", self.on_toggle)
+        m.append(self.toggle_item)
+
+        self.dur_item = Gtk.MenuItem(label="Stay visible for")
+        dur_menu = Gtk.Menu()
+        self.dur_items = {}
+        group = None
+        for arg, label in DURATIONS:
+            it = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+            group = it
+            it.connect("toggled", self.on_duration, arg)
+            dur_menu.append(it)
+            self.dur_items[arg] = it
+        self.dur_item.set_submenu(dur_menu)
+        m.append(self.dur_item)
+
+        self.vis_item = Gtk.MenuItem(label="Who can send")
+        vis_menu = Gtk.Menu()
+        self.vis_everyone = Gtk.RadioMenuItem.new_with_label_from_widget(None, "Everyone")
+        self.vis_contacts = Gtk.RadioMenuItem.new_with_label_from_widget(
+            self.vis_everyone, "Contacts only")
+        self.vis_everyone.connect("toggled", self.on_visibility, "everyone")
+        self.vis_contacts.connect("toggled", self.on_visibility, "contacts")
+        vis_menu.append(self.vis_everyone)
+        vis_menu.append(self.vis_contacts)
+        self.vis_item.set_submenu(vis_menu)
+        m.append(self.vis_item)
+
+        m.append(Gtk.SeparatorMenuItem())
+
+        self.send_item = Gtk.MenuItem(label="Send to")
+        self.send_menu = Gtk.Menu()
+        self.send_item.set_submenu(self.send_menu)
+        m.append(self.send_item)
+
+        m.append(Gtk.SeparatorMenuItem())
+
+        self.name_item = Gtk.MenuItem(label="Name…")
+        self.name_item.connect("activate", self.on_name)
+        m.append(self.name_item)
+        self.dir_item = Gtk.MenuItem(label="Save files to…")
+        self.dir_item.connect("activate", self.on_dir)
+        m.append(self.dir_item)
+        self.open_dir_item = Gtk.MenuItem(label="Open download folder")
+        self.open_dir_item.connect("activate", self.on_open_dir)
+        m.append(self.open_dir_item)
+
+        self.setup_sep = Gtk.SeparatorMenuItem()
+        m.append(self.setup_sep)
+        self.setup_item = Gtk.MenuItem(label="Run omdrop setup")
+        self.setup_item.connect("activate", self.on_setup)
+        m.append(self.setup_item)
+        self.install_item = Gtk.MenuItem(label="How to install omdrop…")
+        self.install_item.connect("activate", lambda _i: open_uri(INSTALL_URL))
+        m.append(self.install_item)
+
+        m.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self.on_quit)
+        m.append(quit_item)
+
+        m.show_all()
+
+    def render(self):
+        """Bring every widget in line with the last status. Cheap; called often."""
+        self.updating = True
+        try:
+            self._render()
+        finally:
+            self.updating = False
+
+    def _render(self):
+        s = self.status
+        installed = self.cli is not None
+        receiving = bool(s and s.get("receiving"))
+        visible = bool(s and s.get("visible"))
+        not_ready = self.doctor is not None and not self.doctor.get("ready")
+
+        # Header, detail line and icon.
+        if not installed:
+            head, detail, icon = "AirDrop: omdrop is not installed", "", "owldrop-indicator-alert"
+        elif self.busy:
+            head, detail = f"AirDrop: {self.busy}", ""
+            icon = "owldrop-indicator-on" if receiving else "owldrop-indicator-off"
+        elif s is None:
+            head, detail, icon = "AirDrop", "Reading status…", "owldrop-indicator-off"
+        elif not receiving:
+            head, icon = "AirDrop: Off", "owldrop-indicator-off"
+            detail = ""
+            if not_ready and self.doctor.get("missing"):
+                detail = "Not ready: " + self.doctor["missing"][0].get("say", "")
+                icon = "owldrop-indicator-alert"
+        elif visible:
+            name = s.get("name") or "this computer"
+            head, icon = f"Visible as “{name}”", "owldrop-indicator-on"
+            detail = self.window_text()
+            if s.get("visibility") == "contacts":
+                n = s.get("senders") or 0
+                who = (f"{n} known sender{'s' if n != 1 else ''}" if n
+                       else "nobody (no known senders)")
+                detail = f"{detail} · contacts only: {who}"
+        else:
+            head, icon = "Receiving, but not visible", "owldrop-indicator-alert"
+            reason = s.get("reason")
+            detail = reason if reason else "The radio is not advertising."
+        self.header.set_label(head)
+        self.detail.set_label(detail)
+        self.detail.set_visible(bool(detail))
+        self.ind.set_icon_full(icon, head)
+        self.ind.set_title(head)
+
+        controls = installed and s is not None
+        self.toggle_item.set_sensitive(controls and not self.busy)
+        self.toggle_item.set_active(receiving)
+
+        want = self.settings.get("duration", "10m")
+        if want not in self.dur_items:
+            want = "10m"
+        self.dur_items[want].set_active(True)
+        self.dur_item.set_sensitive(controls)
+
+        self.vis_item.set_sensitive(controls)
+        if s and s.get("visibility") == "contacts":
+            self.vis_contacts.set_active(True)
+        else:
+            self.vis_everyone.set_active(True)
+
+        name = (s or {}).get("name")
+        self.name_item.set_label(f"Name: {name}…" if name else "Name…")
+        self.name_item.set_sensitive(controls)
+        d = (s or {}).get("dir")
+        self.dir_item.set_label(f"Save files to: {tildify(d)}…" if d else "Save files to…")
+        self.dir_item.set_sensitive(controls)
+        self.open_dir_item.set_sensitive(bool(d))
+
+        self.setup_sep.set_visible(not installed or not_ready)
+        self.setup_item.set_visible(installed and not_ready)
+        self.install_item.set_visible(not installed)
+
+        self.render_peers(receiving and visible)
+
+    def window_text(self):
+        s = self.status
+        mode = s.get("mode")
+        rem = s.get("remaining")
+        if rem is not None:
+            left = rem - (GLib.get_monotonic_time() / 1e6 - self.status_at)
+            return f"{clock(left)} left"
+        if mode == "once":
+            return "until one file arrives"
+        return "until turned off"
+
+    def render_peers(self, visible):
+        # Rebuilt only when what it shows changes: replacing the items under an
+        # open submenu closes or flickers it, and status polls every 2 s.
+        sig = (visible, bool(self.lookup), tuple(sorted(self.sends)),
+               tuple(sorted((mac, p.get("rssi"), self.names.get(mac) or p.get("name"))
+                            for mac, p in self.peers.items())))
+        if sig == getattr(self, "_peers_sig", None):
+            return
+        self._peers_sig = sig
+        for child in self.send_menu.get_children():
+            self.send_menu.remove(child)
+
+        def note(text):
+            it = Gtk.MenuItem(label=text)
+            it.set_sensitive(False)
+            self.send_menu.append(it)
+
+        if not visible:
+            note("Turn on receiving to find nearby devices")
+        else:
+            if not self.peers:
+                note("No devices found yet")
+                note("Open the AirDrop sheet on the other device")
+            for mac, p in sorted(self.peers.items(),
+                                 key=lambda kv: -(kv[1].get("rssi") or -999)):
+                name = self.names.get(mac) or p.get("name")
+                rssi = p.get("rssi")
+                label = name or mac
+                if rssi is not None:
+                    label += f"  ({rssi} dBm)"
+                if mac in self.sends:
+                    label = f"Sending to {name or mac}… (click to cancel)"
+                    it = Gtk.MenuItem(label=label)
+                    it.connect("activate", self.on_cancel_send, mac)
+                else:
+                    it = Gtk.MenuItem(label=label)
+                    sub = Gtk.Menu()
+                    files = Gtk.MenuItem(label="Send files…")
+                    files.connect("activate", self.on_send_files, mac)
+                    link = Gtk.MenuItem(label="Send a link…")
+                    link.connect("activate", self.on_send_link, mac)
+                    sub.append(files)
+                    sub.append(link)
+                    it.set_submenu(sub)
+                self.send_menu.append(it)
+            self.send_menu.append(Gtk.SeparatorMenuItem())
+            if self.lookup:
+                it = Gtk.MenuItem(label="Looking up names… (click to stop)")
+                it.connect("activate", self.on_stop_lookup)
+            else:
+                # Opt-in, as in omdrop: asking a name connects to each device
+                # and briefly announces this Apple ID over Bluetooth.
+                it = Gtk.MenuItem(label="Look up device names")
+                it.connect("activate", self.on_lookup)
+            self.send_menu.append(it)
+        self.send_menu.show_all()
+
+    # ----------------------------------------------------------------- state
+
+    def tick(self):
+        # The countdown moves between polls; nothing else needs redrawing.
+        s = self.status
+        if s and s.get("receiving") and s.get("visible") and s.get("remaining") is not None \
+                and not self.busy:
+            self.updating = True
+            try:
+                self.detail.set_label(self.window_text())
+            finally:
+                self.updating = False
+        return True
+
+    def schedule_poll(self):
+        if self.poll_id:
+            GLib.source_remove(self.poll_id)
+        receiving = bool(self.status and self.status.get("receiving"))
+        self.poll_id = GLib.timeout_add_seconds(
+            POLL_ON_S if receiving else POLL_OFF_S, self._poll)
+
+    def _poll(self):
+        self.poll_id = 0
+        self.refresh_status()
+        return False
+
+    def refresh_status(self):
+        if self.status_cmd:
+            return
+        self.status_cmd = Command([self.cli, "status", "--json"], self._got_status)
+
+    def _got_status(self, rc, out, err):
+        self.status_cmd = None
+        was_visible = bool(self.status and self.status.get("visible"))
+        if rc == 0:
+            try:
+                self.status = json.loads(out)
+                self.status_at = GLib.get_monotonic_time() / 1e6
+            except ValueError:
+                print(f"{APP_ID}: unreadable status: {out!r}", file=sys.stderr)
+        else:
+            print(f"{APP_ID}: omdrop status failed: {err.strip()}", file=sys.stderr)
+        visible = bool(self.status and self.status.get("receiving") and self.status.get("visible"))
+        if visible and not was_visible:
+            self.refresh_peers()
+        if not visible:
+            self.peers = {}
+            if self.lookup:
+                self.lookup.stop()
+        if not (self.status and self.status.get("receiving")) and self.doctor is None:
+            self.refresh_doctor()
+        self.render()
+        self.schedule_poll()
+
+    def refresh_doctor(self):
+        Command([self.cli, "doctor", "--json"], self._got_doctor)
+
+    def _got_doctor(self, rc, out, err):
+        try:
+            self.doctor = json.loads(out) if rc == 0 else None
+        except ValueError:
+            self.doctor = None
+        self.render()
+
+    def refresh_peers(self):
+        """The passive listing: reads the radio's peer table, transmits nothing."""
+        if self.peers_cmd is None and self.status and self.status.get("visible"):
+            self.peers_cmd = Command([self.cli, "peers", "--json"], self._got_peers)
+        return False
+
+    def _got_peers(self, rc, out, err):
+        self.peers_cmd = None
+        if rc == 0:
+            try:
+                fresh = {p["mac"]: p for p in json.loads(out)}
+            except (ValueError, KeyError, TypeError):
+                fresh = None
+            if fresh is not None and fresh != self.peers:
+                self.peers = fresh
+                self.render()
+        if self.status and self.status.get("receiving") and self.status.get("visible"):
+            GLib.timeout_add_seconds(PEERS_S, self.refresh_peers)
+
+    # -------------------------------------------------------------- receiving
+
+    def on_toggle(self, item):
+        if self.updating:
+            return
+        if item.get_active():
+            dur = self.settings.get("duration", "10m")
+            self.run_busy("Turning on…", ["on", dur], "Could not turn AirDrop on")
+        else:
+            self.run_busy("Turning off…", ["off"], "Could not turn AirDrop off")
+
+    def on_duration(self, item, arg):
+        if self.updating or not item.get_active():
+            return
+        self.settings.set("duration", arg)
+        # While on, re-arm the window with the new length, as the panel does.
+        if self.status and self.status.get("receiving"):
+            self.run_busy("Changing how long…", ["on", arg], "Could not change the window")
+
+    def on_visibility(self, item, mode):
+        if self.updating or not item.get_active():
+            return
+        self.run_quiet(["visibility", mode], "Could not change who can send")
+
+    def run_busy(self, label, args, failure):
+        self.busy = label
+        self.render()
+
+        def done(rc, out, err):
+            self.busy = None
+            if rc != 0:
+                notify(failure, last_line(err) or last_line(out) or f"omdrop exited {rc}",
+                       "dialog-warning")
+            self.refresh_status()
+            self.refresh_doctor()
+        Command([self.cli] + args, done)
+
+    def run_quiet(self, args, failure, success=None):
+        def done(rc, out, err):
+            if rc != 0:
+                notify(failure, last_line(err) or last_line(out) or f"omdrop exited {rc}",
+                       "dialog-warning")
+            elif success:
+                notify(success, last_line(out))
+            self.refresh_status()
+        Command([self.cli] + args, done)
+
+    def on_name(self, _item):
+        current = (self.status or {}).get("name") or ""
+        new = ask_text("AirDrop name", "Apple devices will see this computer as:",
+                       current, "Rename")
+        if new is not None and new.strip() and new.strip() != current:
+            self.run_quiet(["name", new.strip()], "Could not rename")
+
+    def on_dir(self, _item):
+        dlg = Gtk.FileChooserNative.new("Save received files to", None,
+                                        Gtk.FileChooserAction.SELECT_FOLDER, "Select", "Cancel")
+        d = (self.status or {}).get("dir")
+        if d and os.path.isdir(d):
+            dlg.set_current_folder(d)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            path = dlg.get_filename()
+            if path:
+                self.run_quiet(["dir", path], "Could not change the download folder")
+        dlg.destroy()
+
+    def on_open_dir(self, _item):
+        d = (self.status or {}).get("dir")
+        if d:
+            open_uri(Gio.File.new_for_path(d).get_uri())
+
+    def on_setup(self, _item):
+        def done(rc, out, err):
+            body = (out.strip() or err.strip())[-600:]
+            notify("omdrop setup" if rc == 0 else "omdrop setup failed", body,
+                   None if rc == 0 else "dialog-warning")
+            self.refresh_doctor()
+            self.refresh_status()
+        Command([self.cli, "setup"], done)
+
+    def follow_receiver(self):
+        """Announce arrivals from the receiver's log, as `omdrop watch` does."""
+        if not shutil.which("journalctl"):
+            return
+        self.journal = Command(
+            ["journalctl", "--user", "-u", RECEIVER_UNIT, "-f", "-n", "0", "-o", "cat"],
+            self._journal_ended, on_line=self._journal_line)
+
+    def _journal_ended(self, rc, out, err):
+        # journalctl should never end; if it does, try again shortly.
+        self.journal = None
+        GLib.timeout_add_seconds(5, lambda: (self.follow_receiver(), False)[1])
+
+    def _journal_line(self, line):
+        files = []
+        if "upload " in line and ": stored " in line:
+            files = line.split(": stored ", 1)[1].split(",")
+        elif "link stored as " in line:
+            files = [line.split("link stored as ", 1)[1].split(" -> ", 1)[0]]
+        d = (self.status or {}).get("dir") or os.path.expanduser("~/Downloads")
+        for f in (f.strip() for f in files):
+            if not f:
+                continue
+            path = f if f.startswith("/") else os.path.join(d, f)
+            if os.path.exists(path):
+                self.announce(path)
+
+    def announce(self, path):
+        n = Notify.Notification.new(os.path.basename(path),
+                                    f"Received over AirDrop, saved to {tildify(os.path.dirname(path))}/",
+                                    "document-save")
+        uri = Gio.File.new_for_path(path).get_uri()
+        if "actions" in Notify.get_server_caps():
+            n.add_action("default", "Open", lambda *_: open_uri(uri))
+            n.add_action("open", "Open", lambda *_: open_uri(uri))
+            n.add_action("show", "Show in folder", lambda *_: show_in_folder(path))
+        keep(self.notes, n)
+
+    # ---------------------------------------------------------------- sending
+
+    def on_lookup(self, _item):
+        if self.lookup:
+            return
+
+        def line(text):
+            try:
+                p = json.loads(text)
+            except ValueError:
+                return
+            mac = p.get("mac")
+            if not mac:
+                return
+            if p.get("name"):
+                self.names[mac] = p["name"]
+            self.peers.setdefault(mac, p)
+            self.render()
+
+        def done(rc, out, err):
+            self.lookup = None
+            if rc not in (0, 1, -1, 143) and err.strip():
+                notify("Could not look up names", last_line(err), "dialog-warning")
+            self.render()
+        self.lookup = Command([self.cli, "peers", "--json", "-n", "--stream"], done,
+                              on_line=line)
+        self.render()
+
+    def on_stop_lookup(self, _item):
+        if self.lookup:
+            self.lookup.stop()
+
+    def peer_label(self, mac):
+        return self.names.get(mac) or (self.peers.get(mac) or {}).get("name") or mac
+
+    def on_send_files(self, _item, mac):
+        dlg = Gtk.FileChooserNative.new(f"Send to {self.peer_label(mac)}", None,
+                                        Gtk.FileChooserAction.OPEN, "Send", "Cancel")
+        dlg.set_select_multiple(True)
+        start = self.settings.get("send_from", "")
+        if start and os.path.isdir(start):
+            dlg.set_current_folder(start)
+        files = []
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            files = [f for f in dlg.get_filenames() if f]
+        dlg.destroy()
+        if files:
+            self.settings.set("send_from", os.path.dirname(files[0]))
+            what = os.path.basename(files[0]) if len(files) == 1 else f"{len(files)} files"
+            self.send(mac, files, what)
+
+    def on_send_link(self, _item, mac):
+        url = ask_text("Send a link", f"Link to send to {self.peer_label(mac)}:", "", "Send")
+        if url and url.strip():
+            url = url.strip()
+            if not url.startswith(("http://", "https://")):
+                notify("Not sent", "Only http and https links can be sent.", "dialog-warning")
+                return
+            self.send(mac, [url], url)
+
+    def send(self, mac, items, what):
+        who = self.peer_label(mac)
+
+        def done(rc, out, err):
+            self.sends.pop(mac, None)
+            if rc == 0:
+                notify(f"Sent to {who}", what, "document-send")
+            elif rc in (-1, 143, 130):
+                notify("Send cancelled", f"{what} to {who}")
+            else:
+                notify(f"Could not send to {who}",
+                       last_line(err) or last_line(out) or f"omdrop exited {rc}",
+                       "dialog-warning")
+            self.render()
+        self.sends[mac] = Command([self.cli, "send", "--to", mac, "--"] + items, done)
+        self.render()
+
+    def on_cancel_send(self, _item, mac):
+        cmd = self.sends.get(mac)
+        if cmd:
+            cmd.stop()
+
+    def on_quit(self, _item):
+        if self.lookup:
+            self.lookup.stop()
+        if self.journal:
+            self.journal.stop()
+        Gtk.main_quit()
+
+
+# ------------------------------------------------------------------ helpers
+
+def keep(store, n):
+    """Show a notification and hold a reference until it closes, or its
+    actions are collected before anyone can click them."""
+    store.add(n)
+    n.connect("closed", lambda n: store.discard(n))
+    try:
+        n.show()
+    except GLib.Error as e:
+        store.discard(n)
+        print(f"{APP_ID}: notification failed: {e.message}", file=sys.stderr)
+
+
+_NOTES = set()
+
+
+def notify(summary, body="", icon=None):
+    keep(_NOTES, Notify.Notification.new(summary, body, icon or "document-send"))
+
+
+def open_uri(uri):
+    try:
+        Gio.AppInfo.launch_default_for_uri(uri, None)
+    except GLib.Error as e:
+        notify("Could not open", e.message, "dialog-warning")
+
+
+def show_in_folder(path):
+    """Select the file in the file manager, or at least open its folder."""
+    uri = Gio.File.new_for_path(path).get_uri()
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.call_sync("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                      "org.freedesktop.FileManager1", "ShowItems",
+                      GLib.Variant("(ass)", ([uri], "")), None,
+                      Gio.DBusCallFlags.NONE, 2000, None)
+    except GLib.Error:
+        open_uri(Gio.File.new_for_path(os.path.dirname(path)).get_uri())
+
+
+def ask_text(title, prompt, initial, accept):
+    """A one-line text dialog. Returns the text, or None when cancelled."""
+    dlg = Gtk.Dialog(title=title, flags=Gtk.DialogFlags.MODAL)
+    dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, accept, Gtk.ResponseType.OK)
+    dlg.set_default_response(Gtk.ResponseType.OK)
+    dlg.set_icon_name("owldrop-indicator-on")
+    box = dlg.get_content_area()
+    box.set_spacing(8)
+    box.set_border_width(12)
+    box.add(Gtk.Label(label=prompt, xalign=0))
+    entry = Gtk.Entry(text=initial, activates_default=True, width_chars=36)
+    box.add(entry)
+    dlg.show_all()
+    dlg.set_keep_above(True)
+    dlg.present()
+    text = entry.get_text() if dlg.run() == Gtk.ResponseType.OK else None
+    dlg.destroy()
+    return text
+
+
+def main():
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_ID} 0.1.0")
+        return 0
+    GLib.set_prgname(APP_ID)
+    GLib.set_application_name("Owldrop")
+    Notify.init("Owldrop")
+    # One indicator per session: a second copy would put a second icon in the tray.
+    app = Gio.Application(application_id="io.github.owldrop.Indicator",
+                          flags=Gio.ApplicationFlags.FLAGS_NONE)
+    try:
+        app.register(None)
+    except GLib.Error:
+        pass
+    if app.get_is_remote():
+        print(f"{APP_ID}: already running", file=sys.stderr)
+        return 0
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except (ValueError, ImportError):
+        signal_add = GLib.unix_signal_add
+    signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, Gtk.main_quit)
+    signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, Gtk.main_quit)
+    Indicator()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

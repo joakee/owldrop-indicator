@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Owldrop
+GenericName=AirDrop
+Comment=Send and receive files with nearby Apple devices from the panel
+Exec=owldrop-indicator
+Icon=owldrop-indicator-on
+Terminal=false
+Categories=Network;FileTransfer;GTK;
+Keywords=airdrop;owldrop;apple;iphone;share;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-XFCE-Autostart-Override=true
