@@ -16,18 +16,16 @@ import os
 import shutil
 import signal
 import sys
+from types import SimpleNamespace
 
 import gi
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("Notify", "0.7")
-try:
-    gi.require_version("AyatanaAppIndicator3", "0.1")
-    from gi.repository import AyatanaAppIndicator3 as AppIndicator
-except (ValueError, ImportError):
-    gi.require_version("AppIndicator3", "0.1")
-    from gi.repository import AppIndicator3 as AppIndicator
-from gi.repository import Gio, GLib, Gtk, Notify  # noqa: E402
+gi.require_version("Dbusmenu", "0.4")
+gi.require_version("DbusmenuGtk3", "0.4")
+from gi.repository import Dbusmenu, DbusmenuGtk3, Gdk, Gio, GLib, Gtk, Notify  # noqa: E402
 
 APP_ID = "owldrop-indicator"
 RECEIVER_UNIT = "airdrop-receiver.service"
@@ -42,7 +40,10 @@ DURATIONS = [
     ("forever", "Until turned off"),
 ]
 
-POLL_ON_S = 2      # status while receiving: the countdown and visibility move
+DURATION_SHORT = {"once": "Once", "10m": "10 min", "30m": "30 min", "1h": "1 hr",
+                  "forever": "Always"}
+
+POLL_ON_S = 2     # status while receiving: the countdown and visibility move
 POLL_OFF_S = 10    # status while off: only someone else turning it on changes it
 PEERS_S = 5        # passive peer listing while visible; transmits nothing
 
@@ -179,6 +180,426 @@ class Command:
             self.proc.send_signal(signal.SIGTERM)
 
 
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
+    <signal name="NewOverlayIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus"><arg name="status" type="s"/></signal>
+  </interface>
+</node>
+"""
+SNI_PATH = "/StatusNotifierItem"
+SNI_IFACE = "org.kde.StatusNotifierItem"
+MENU_PATH = "/MenuBar"
+WATCHER = "org.kde.StatusNotifierWatcher"
+
+
+class TrayIcon:
+    """The panel icon, as a StatusNotifierItem.
+
+    Implemented here rather than through AppIndicator because AppIndicator
+    marks its icon menu-only, so a left click can only ever open a GtkMenu.
+    This item is not menu-only: the tray sends a left click here as Activate
+    (with the pointer's screen position), and shows `menu` on a right click.
+    """
+
+    def __init__(self, menu, icon_dir, on_activate, on_secondary):
+        self.on_activate = on_activate
+        self.on_secondary = on_secondary
+        self.icon = "owldrop-indicator-off"
+        self.title = "AirDrop"
+        self.icon_dir = icon_dir or ""
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+
+        # The right-click menu, served over com.canonical.dbusmenu as
+        # AppIndicator serves it: the parser follows later changes to `menu`.
+        self.menu_server = Dbusmenu.Server.new(MENU_PATH)
+        self.menu_server.set_root(DbusmenuGtk3.gtk_parse_menu_structure(menu))
+
+        info = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        # register_object_with_closures2 is GLib 2.84's name for it.
+        register = (getattr(self.bus, "register_object_with_closures2", None)
+                    or self.bus.register_object)
+        register(SNI_PATH, info, self._call, self._get, None)
+        Gio.bus_own_name_on_connection(self.bus, self.name, Gio.BusNameOwnerFlags.NONE,
+                                       None, None)
+        # Register with the tray whenever one is running, including one that
+        # starts, or restarts, after us.
+        Gio.bus_watch_name_on_connection(self.bus, WATCHER, Gio.BusNameWatcherFlags.NONE,
+                                         self._watcher_appeared, None)
+
+    def _watcher_appeared(self, bus, name, owner):
+        bus.call(WATCHER, "/StatusNotifierWatcher", WATCHER, "RegisterStatusNotifierItem",
+                 GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE, -1,
+                 None, self._registered)
+
+    def _registered(self, bus, res):
+        try:
+            bus.call_finish(res)
+        except GLib.Error as e:
+            print(f"{APP_ID}: the tray refused the icon: {e.message}", file=sys.stderr)
+
+    def _call(self, bus, sender, path, iface, method, params, invocation):
+        if method == "Activate":
+            self.on_activate(*params.unpack())
+        elif method == "SecondaryActivate":
+            self.on_secondary()
+        # ContextMenu is only called by trays that cannot show dbusmenu
+        # menus themselves; Scroll has nothing to do here.
+        invocation.return_value(None)
+
+    def _get(self, bus, sender, path, iface, prop):
+        return {
+            "Category": GLib.Variant("s", "Communications"),
+            "Id": GLib.Variant("s", APP_ID),
+            "Title": GLib.Variant("s", self.title),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", self.icon),
+            "IconThemePath": GLib.Variant("s", self.icon_dir),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", (self.icon, [], self.title, "")),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", MENU_PATH),
+        }.get(prop)
+
+    def set(self, icon, title):
+        if icon != self.icon:
+            self.icon = icon
+            self._emit("NewIcon")
+        if title != self.title:
+            self.title = title
+            self._emit("NewTitle")
+            self._emit("NewToolTip")
+
+    def _emit(self, signal_name):
+        try:
+            self.bus.emit_signal(None, SNI_PATH, SNI_IFACE, signal_name, None)
+        except GLib.Error:
+            pass
+
+
+class Popup:
+    """The left-click drop-down.
+
+    A window of our own rather than a GtkMenu, because an open GtkMenu never
+    grows: rows added while it is open, as nearby devices are found, leave it
+    the height it opened with, scrolling. This window grows with its content,
+    and keeps its edge against the panel while it does.
+    """
+
+    def __init__(self, ind):
+        self.ind = ind
+        self.anchor = None          # the click's screen position
+        self.seat = None            # held while open on X11
+        self.place_id = 0
+        self.rows = {}              # mac -> widgets of that device's row
+        display = Gdk.Display.get_default()
+        # A popup window and a pointer grab place it under the icon and close
+        # it on an outside click, as a menu does. Wayland allows neither to a
+        # plain client, so there it is a small undecorated window that closes
+        # when it loses focus.
+        self.x11 = not display.get_name().startswith("wayland")
+        if self.x11:
+            w = self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
+            w.set_type_hint(Gdk.WindowTypeHint.DROPDOWN_MENU)
+            w.connect("button-press-event", self._outside_click)
+        else:
+            w = self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            w.set_decorated(False)
+            w.set_skip_taskbar_hint(True)
+            w.set_skip_pager_hint(True)
+            w.set_keep_above(True)
+            w.set_position(Gtk.WindowPosition.MOUSE)
+            w.connect("focus-out-event", lambda *_: self.close())
+        w.set_resizable(False)
+        w.get_style_context().add_class("popup")
+        w.get_style_context().add_class("menu")
+        w.connect("key-press-event", self._key)
+        w.connect("size-allocate", self._resized)
+        self._build()
+
+    # --------------------------------------------------------------- widgets
+
+    def _build(self):
+        ind = self.ind
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.OUT)
+        self.win.add(frame)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(12)
+        box.set_size_request(340, -1)
+        frame.add(box)
+
+        top = Gtk.Box(spacing=12)
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<b>AirDrop</b>")
+        top.pack_start(title, True, True, 0)
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.switch.connect("notify::active", self._switched)
+        top.pack_end(self.switch, False, False, 0)
+        box.add(top)
+
+        self.head = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+        box.add(self.head)
+        self.detail = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+        self.detail.get_style_context().add_class("dim-label")
+        box.add(self.detail)
+
+        def segmented(caption, choices, handler):
+            row = Gtk.Box(spacing=8)
+            lab = Gtk.Label(label=caption, xalign=0)
+            row.pack_start(lab, True, True, 0)
+            group = Gtk.Box()
+            group.get_style_context().add_class("linked")
+            buttons, first = {}, None
+            for key, text in choices:
+                b = Gtk.RadioButton.new_with_label_from_widget(first, text)
+                b.set_mode(False)       # drawn as a button, not a radio dot
+                b.connect("toggled", handler, key)
+                group.add(b)
+                buttons[key] = b
+                first = first or b
+            row.pack_end(group, False, False, 0)
+            box.add(row)
+            return row, buttons
+
+        self.dur_row, self.dur_buttons = segmented(
+            "Visible for", [(a, DURATION_SHORT[a]) for a, _ in DURATIONS], ind.on_duration)
+        self.vis_row, self.vis_buttons = segmented(
+            "Who can send", [("everyone", "Everyone"), ("contacts", "Contacts")],
+            ind.on_visibility)
+
+        box.add(Gtk.Separator())
+        send = Gtk.Label(xalign=0)
+        send.set_markup("<b>Send to</b>")
+        box.add(send)
+        self.hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+        self.hint.get_style_context().add_class("dim-label")
+        box.add(self.hint)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.add(self.list)
+        # Opt-in, as in omdrop: asking a name connects to each device and
+        # briefly announces this Apple ID over Bluetooth.
+        self.lookup = Gtk.Button(label="Look up device names", halign=Gtk.Align.START)
+        self.lookup.set_relief(Gtk.ReliefStyle.NONE)
+        self.lookup.connect("clicked", ind.on_lookup)
+        box.add(self.lookup)
+
+        box.add(Gtk.Separator())
+        foot = Gtk.Box(spacing=6, homogeneous=True)
+        self.name_btn = Gtk.Button(label="Name…")
+        self.name_btn.connect("clicked", self._closing(ind.on_name))
+        self.dir_btn = Gtk.Button(label="Folder…")
+        self.dir_btn.connect("clicked", self._closing(ind.on_dir))
+        self.open_btn = Gtk.Button(label="Open folder")
+        self.open_btn.connect("clicked", self._closing(ind.on_open_dir))
+        for b in (self.name_btn, self.dir_btn, self.open_btn):
+            foot.add(b)
+        box.add(foot)
+        self.setup_btn = Gtk.Button(label="Run omdrop setup")
+        self.setup_btn.connect("clicked", self._closing(ind.on_setup))
+        box.add(self.setup_btn)
+        self.install_btn = Gtk.Button(label="How to install omdrop…")
+        self.install_btn.connect("clicked", self._closing(lambda _w: open_uri(INSTALL_URL)))
+        box.add(self.install_btn)
+        frame.show_all()
+
+    def _closing(self, handler, *args):
+        # Dialogs and file choosers need the pointer this window holds.
+        def run(_w):
+            self.close()
+            handler(None, *args)
+        return run
+
+    def _switched(self, switch, _pspec):
+        if not self.ind.updating:
+            self.ind.toggle_item.set_active(switch.get_active())
+
+    def render(self, v):
+        """Bring the window in line with the indicator's view of things."""
+        ind = self.ind
+        self.head.set_label(v.head)
+        self.detail.set_label(v.detail)
+        self.detail.set_visible(bool(v.detail))
+        self.switch.set_active(v.receiving)
+        self.switch.set_sensitive(v.controls and not ind.busy)
+        self.dur_buttons[v.duration].set_active(True)
+        self.vis_buttons["contacts" if v.contacts else "everyone"].set_active(True)
+        for w in (self.dur_row, self.vis_row, self.name_btn, self.dir_btn):
+            w.set_sensitive(v.controls)
+        self.open_btn.set_sensitive(v.dir is not None)
+        self.name_btn.set_tooltip_text(f"Apple devices see “{v.name}”" if v.name else None)
+        self.dir_btn.set_tooltip_text(f"Saving to {tildify(v.dir)}" if v.dir else None)
+        self.setup_btn.set_visible(v.installed and v.not_ready)
+        self.install_btn.set_visible(not v.installed)
+        self.render_peers(v.receiving and v.visible)
+
+    def render_peers(self, visible):
+        ind = self.ind
+        shown = ind.peers if visible else {}
+        for mac in [mac for mac in self.rows if mac not in shown]:
+            self.rows.pop(mac)["row"].destroy()
+        # Rows keep the order devices were first seen in, so one does not
+        # jump away from the pointer when its signal reading changes.
+        for mac, p in shown.items():
+            r = self.rows.get(mac) or self._add_row(mac)
+            r["name"].set_label(ind.peer_label(mac))
+            rssi = p.get("rssi")
+            r["rssi"].set_label(f"{rssi} dBm" if rssi is not None else "")
+            sending = mac in ind.sends
+            for w in (r["files"], r["link"]):
+                w.set_visible(not sending)
+            for w in (r["spinner"], r["cancel"]):
+                w.set_visible(sending)
+            r["spinner"].props.active = sending
+
+        if not visible:
+            hint = "Turn on AirDrop to find nearby devices."
+        elif not shown:
+            hint = "None yet. Open the AirDrop sheet on the other device."
+        else:
+            hint = ""
+        self.hint.set_label(hint)
+        self.hint.set_visible(bool(hint))
+        self.lookup.set_visible(visible)
+        self.lookup.set_label("Stop looking up names" if ind.lookup else "Look up device names")
+
+    def _add_row(self, mac):
+        ind = self.ind
+        row = Gtk.Box(spacing=6)
+        name = Gtk.Label(xalign=0, ellipsize=3)     # Pango.EllipsizeMode.END
+        row.pack_start(name, True, True, 0)
+        rssi = Gtk.Label()
+        rssi.get_style_context().add_class("dim-label")
+        row.pack_start(rssi, False, False, 0)
+        files = Gtk.Button(label="Files…")
+        files.connect("clicked", self._closing(ind.on_send_files, mac))
+        link = Gtk.Button(label="Link…")
+        link.connect("clicked", self._closing(ind.on_send_link, mac))
+        spinner = Gtk.Spinner()
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", ind.on_cancel_send, mac)
+        for w in (files, link, spinner, cancel):
+            row.pack_start(w, False, False, 0)
+        row.show_all()
+        self.list.add(row)
+        r = self.rows[mac] = {"row": row, "name": name, "rssi": rssi, "files": files,
+                              "link": link, "spinner": spinner, "cancel": cancel}
+        return r
+
+    # ----------------------------------------------------------- open, close
+
+    def toggle(self, x, y):
+        if self.win.get_visible():
+            self.close()
+        else:
+            self.open(x, y)
+
+    def open(self, x, y):
+        self.anchor = (x, y)
+        self.ind.render()
+        if self.x11:
+            self.place()
+        self.win.show()
+        self.win.present()
+        if self.x11:
+            self._grab(5)
+        self.ind.refresh_status()
+
+    def _grab(self, tries):
+        # The tray may still hold the pointer from the click for a moment.
+        seat = self.win.get_display().get_default_seat()
+        status = seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True,
+                           None, None, None, None)
+        if status == Gdk.GrabStatus.SUCCESS:
+            self.seat = seat
+            self.win.grab_add()
+        elif tries > 0 and self.win.get_visible():
+            GLib.timeout_add(50, lambda: self._grab(tries - 1))
+        return False
+
+    def close(self):
+        if self.seat:
+            self.seat.ungrab()
+            self.seat = None
+            self.win.grab_remove()
+        self.win.hide()
+
+    def _outside_click(self, win, event):
+        alloc = win.get_allocation()
+        if not (0 <= event.x < alloc.width and 0 <= event.y < alloc.height):
+            self.close()
+            return True
+        return False
+
+    def _key(self, win, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+    def _resized(self, win, alloc):
+        # Growing moves the window too when it hangs above a bottom panel, so
+        # it keeps its edge against the panel; in an idle, after GTK's own
+        # resize has gone through.
+        if self.x11 and win.get_visible() and not self.place_id:
+            self.place_id = GLib.idle_add(self._replace)
+
+    def _replace(self):
+        self.place_id = 0
+        if self.win.get_visible():
+            self.place()
+        return False
+
+    def place(self):
+        """Put the window against the panel the click came from."""
+        x, y = self.anchor
+        display = self.win.get_display()
+        monitor = display.get_monitor_at_point(x, y) or display.get_primary_monitor()
+        wa = monitor.get_workarea()
+        _, nat = self.win.get_preferred_size()
+        w, h = nat.width, nat.height
+        right, bottom = wa.x + wa.width, wa.y + wa.height
+        if y >= bottom:                 # bottom panel: hang above it
+            top = bottom - h
+        elif y < wa.y:                  # top panel: hang below it
+            top = wa.y
+        else:                           # side panel, or one that reserves no space
+            top = y - h if y > wa.y + wa.height // 2 else y
+        if x >= right:
+            left = right - w
+        elif x < wa.x:
+            left = wa.x
+        else:
+            left = x - w // 2
+        left = max(wa.x, min(left, right - w))
+        top = max(wa.y, min(top, bottom - h))
+        self.win.move(left, top)
+
+
 class Indicator:
     def __init__(self):
         self.cli = find_cli()
@@ -198,20 +619,15 @@ class Indicator:
         self.updating = False       # set while syncing widgets to state, so handlers stay quiet
         self.poll_id = 0
 
-        self.ind = AppIndicator.Indicator.new(
-            APP_ID, "owldrop-indicator-off",
-            AppIndicator.IndicatorCategory.COMMUNICATIONS)
-        here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
-        if os.path.isdir(here):
-            self.ind.set_icon_theme_path(here)
-        self.ind.set_title("AirDrop")
-        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-
         self.build_menu()
-        self.ind.set_menu(self.menu)
-        # Middle-click on the icon toggles receiving, as it mutes in the
-        # volume applets.
-        self.ind.set_secondary_activate_target(self.toggle_item)
+        self.popup = Popup(self)
+        here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
+        # Left click opens the drop-down, right click the menu, and a middle
+        # click toggles receiving, as it mutes in the volume applets.
+        self.tray = TrayIcon(self.menu, here if os.path.isdir(here) else None,
+                             self.popup.toggle,
+                             lambda: self.toggle_item.set_active(
+                                 not self.toggle_item.get_active()))
 
         if self.cli:
             self.refresh_status()
@@ -263,9 +679,10 @@ class Indicator:
 
         m.append(Gtk.SeparatorMenuItem())
 
-        self.send_item = Gtk.MenuItem(label="Send to")
-        self.send_menu = Gtk.Menu()
-        self.send_item.set_submenu(self.send_menu)
+        # Nearby devices are listed only in the left-click drop-down: they
+        # arrive while it is open, and an open GtkMenu cannot grow to fit them.
+        self.send_item = Gtk.MenuItem(label="Send files: left-click the icon")
+        self.send_item.set_sensitive(False)
         m.append(self.send_item)
 
         m.append(Gtk.SeparatorMenuItem())
@@ -304,45 +721,50 @@ class Indicator:
         finally:
             self.updating = False
 
-    def _render(self):
+    def describe(self):
+        """The header, status line and icon for the current state."""
         s = self.status
-        installed = self.cli is not None
         receiving = bool(s and s.get("receiving"))
-        visible = bool(s and s.get("visible"))
         not_ready = self.doctor is not None and not self.doctor.get("ready")
-
-        # Header, detail line and icon.
-        if not installed:
-            head, detail, icon = "AirDrop: omdrop is not installed", "", "owldrop-indicator-alert"
-        elif self.busy:
-            head, detail = f"AirDrop: {self.busy}", ""
-            icon = "owldrop-indicator-on" if receiving else "owldrop-indicator-off"
-        elif s is None:
-            head, detail, icon = "AirDrop", "Reading status…", "owldrop-indicator-off"
-        elif not receiving:
-            head, icon = "AirDrop: Off", "owldrop-indicator-off"
-            detail = ""
+        if self.cli is None:
+            return ("AirDrop: omdrop is not installed",
+                    "owldrop needs the omdrop command.", "owldrop-indicator-alert")
+        if self.busy:
+            return (f"AirDrop: {self.busy}", "One moment…",
+                    "owldrop-indicator-on" if receiving else "owldrop-indicator-off")
+        if s is None:
+            return "AirDrop", "Reading status…", "owldrop-indicator-off"
+        if not receiving:
             if not_ready and self.doctor.get("missing"):
-                detail = "Not ready: " + self.doctor["missing"][0].get("say", "")
-                icon = "owldrop-indicator-alert"
-        elif visible:
+                return ("AirDrop: Off",
+                        "Not ready: " + self.doctor["missing"][0].get("say", ""),
+                        "owldrop-indicator-alert")
+            return "AirDrop: Off", "Not visible to nearby devices.", "owldrop-indicator-off"
+        if s.get("visible"):
             name = s.get("name") or "this computer"
-            head, icon = f"Visible as “{name}”", "owldrop-indicator-on"
             detail = self.window_text()
             if s.get("visibility") == "contacts":
                 n = s.get("senders") or 0
                 who = (f"{n} known sender{'s' if n != 1 else ''}" if n
                        else "nobody (no known senders)")
                 detail = f"{detail} · contacts only: {who}"
-        else:
-            head, icon = "Receiving, but not visible", "owldrop-indicator-alert"
-            reason = s.get("reason")
-            detail = reason if reason else "The radio is not advertising."
+            return f"Visible as \u201c{name}\u201d", detail, "owldrop-indicator-on"
+        return ("Receiving, but not visible",
+                s.get("reason") or "The radio is not advertising.", "owldrop-indicator-alert")
+
+    def _render(self):
+        s = self.status
+        installed = self.cli is not None
+        receiving = bool(s and s.get("receiving"))
+        visible = bool(s and s.get("visible"))
+        not_ready = self.doctor is not None and not self.doctor.get("ready")
+        head, detail, icon = self.describe()
+
+        # The menu's rows stay the same from state to state, so its height
+        # does not change while it is open: an open GtkMenu cannot grow.
         self.header.set_label(head)
         self.detail.set_label(detail)
-        self.detail.set_visible(bool(detail))
-        self.ind.set_icon_full(icon, head)
-        self.ind.set_title(head)
+        self.tray.set(icon, head)
 
         controls = installed and s is not None
         self.toggle_item.set_sensitive(controls and not self.busy)
@@ -354,11 +776,9 @@ class Indicator:
         self.dur_items[want].set_active(True)
         self.dur_item.set_sensitive(controls)
 
+        contacts = bool(s and s.get("visibility") == "contacts")
         self.vis_item.set_sensitive(controls)
-        if s and s.get("visibility") == "contacts":
-            self.vis_contacts.set_active(True)
-        else:
-            self.vis_everyone.set_active(True)
+        (self.vis_contacts if contacts else self.vis_everyone).set_active(True)
 
         name = (s or {}).get("name")
         self.name_item.set_label(f"Name: {name}…" if name else "Name…")
@@ -372,7 +792,10 @@ class Indicator:
         self.setup_item.set_visible(installed and not_ready)
         self.install_item.set_visible(not installed)
 
-        self.render_peers(receiving and visible)
+        self.popup.render(SimpleNamespace(
+            head=head, detail=detail, installed=installed, controls=controls,
+            receiving=receiving, visible=visible, not_ready=not_ready, duration=want,
+            contacts=contacts, name=name, dir=d))
 
     def window_text(self):
         s = self.status
@@ -385,63 +808,6 @@ class Indicator:
             return "until one file arrives"
         return "until turned off"
 
-    def render_peers(self, visible):
-        # Rebuilt only when what it shows changes: replacing the items under an
-        # open submenu closes or flickers it, and status polls every 2 s.
-        sig = (visible, bool(self.lookup), tuple(sorted(self.sends)),
-               tuple(sorted((mac, p.get("rssi"), self.names.get(mac) or p.get("name"))
-                            for mac, p in self.peers.items())))
-        if sig == getattr(self, "_peers_sig", None):
-            return
-        self._peers_sig = sig
-        for child in self.send_menu.get_children():
-            self.send_menu.remove(child)
-
-        def note(text):
-            it = Gtk.MenuItem(label=text)
-            it.set_sensitive(False)
-            self.send_menu.append(it)
-
-        if not visible:
-            note("Turn on receiving to find nearby devices")
-        else:
-            if not self.peers:
-                note("No devices found yet")
-                note("Open the AirDrop sheet on the other device")
-            for mac, p in sorted(self.peers.items(),
-                                 key=lambda kv: -(kv[1].get("rssi") or -999)):
-                name = self.names.get(mac) or p.get("name")
-                rssi = p.get("rssi")
-                label = name or mac
-                if rssi is not None:
-                    label += f"  ({rssi} dBm)"
-                if mac in self.sends:
-                    label = f"Sending to {name or mac}… (click to cancel)"
-                    it = Gtk.MenuItem(label=label)
-                    it.connect("activate", self.on_cancel_send, mac)
-                else:
-                    it = Gtk.MenuItem(label=label)
-                    sub = Gtk.Menu()
-                    files = Gtk.MenuItem(label="Send files…")
-                    files.connect("activate", self.on_send_files, mac)
-                    link = Gtk.MenuItem(label="Send a link…")
-                    link.connect("activate", self.on_send_link, mac)
-                    sub.append(files)
-                    sub.append(link)
-                    it.set_submenu(sub)
-                self.send_menu.append(it)
-            self.send_menu.append(Gtk.SeparatorMenuItem())
-            if self.lookup:
-                it = Gtk.MenuItem(label="Looking up names… (click to stop)")
-                it.connect("activate", self.on_stop_lookup)
-            else:
-                # Opt-in, as in omdrop: asking a name connects to each device
-                # and briefly announces this Apple ID over Bluetooth.
-                it = Gtk.MenuItem(label="Look up device names")
-                it.connect("activate", self.on_lookup)
-            self.send_menu.append(it)
-        self.send_menu.show_all()
-
     # ----------------------------------------------------------------- state
 
     def tick(self):
@@ -451,7 +817,9 @@ class Indicator:
                 and not self.busy:
             self.updating = True
             try:
-                self.detail.set_label(self.window_text())
+                _, detail, _ = self.describe()
+                self.detail.set_label(detail)
+                self.popup.detail.set_label(detail)
             finally:
                 self.updating = False
         return True
@@ -647,6 +1015,7 @@ class Indicator:
 
     def on_lookup(self, _item):
         if self.lookup:
+            self.lookup.stop()
             return
 
         def line(text):
@@ -670,10 +1039,6 @@ class Indicator:
         self.lookup = Command([self.cli, "peers", "--json", "-n", "--stream"], done,
                               on_line=line)
         self.render()
-
-    def on_stop_lookup(self, _item):
-        if self.lookup:
-            self.lookup.stop()
 
     def peer_label(self, mac):
         return self.names.get(mac) or (self.peers.get(mac) or {}).get("name") or mac

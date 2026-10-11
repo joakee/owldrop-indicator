@@ -7,7 +7,7 @@ pkgrel=1
 pkgdesc="Desktop-agnostic AirDrop tray indicator: receive, send and get notified from any panel, through omdrop"
 arch=('any')
 license=('MIT')
-depends=('python' 'python-gobject' 'gtk3' 'libayatana-appindicator' 'libnotify' 'systemd')
+depends=('python' 'python-gobject' 'gtk3' 'libdbusmenu-gtk3' 'libnotify' 'systemd')
 optdepends=('omdrop-owl: AirDrop radio backend for non-Apple Wi-Fi cards'
             'xfce4-notifyd: notifications on XFCE')
 

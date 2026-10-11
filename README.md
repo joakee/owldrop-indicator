@@ -9,23 +9,28 @@ waybar, polybar and the like on a bare WM).
 Under the hood it drives the [omdrop](https://github.com/t4t5/omdrop-plugin)
 command, which does the AirDrop protocol work. omdrop's ownis designed for only Omarchy. This one works (hopefully) everywhere else, as it implements a standard notification area applet. Tested and verified to be working in XFCE4 via the Status Tray Plugin for `xfce4-panel`.
 
+Left-click the icon for the drop-down:
+
 ```
-Visible as "test-system"
-8:59 left
-[x] Receive files
-    Stay visible for      ▸  Until one file arrives / 10 minutes / 30 minutes / 1 hour / Until turned off
-    Who can send          ▸  Everyone / Contacts only
-────────────
-    Send to               ▸  James iPhone (-48 dBm) ▸ Send files… / Send a link…
-────────────
-    Name: test-system…
-    Save files to: ~/Downloads…
-    Open download folder
-────────────
-    Quit
+┌───────────────────────────────────────────────┐
+│ AirDrop                                 [ ON] │
+│ Visible as "test-system"                      │
+│ 8:59 left                                     │
+│ Visible for   [Once|10 min|30 min|1 hr|Always]│
+│ Who can send            [Everyone | Contacts] │
+├───────────────────────────────────────────────┤
+│ Send to                                       │
+│ James iPhone          -48 dBm  [Files…][Link…]│
+│ Studio Mac            -61 dBm  [Files…][Link…]│
+│ Look up device names                          │
+├───────────────────────────────────────────────┤
+│ [ Name… ]       [ Folder… ]     [Open folder] │
+└───────────────────────────────────────────────┘
 ```
 
-Middle-click the icon to turn receiving on or off.
+It grows as devices are found, staying against the panel. Right-click for a
+classic menu with the same settings and Quit, and middle-click to turn
+receiving on or off. Escape, or a click anywhere else, closes the drop-down.
 
 ## Requirements
 
@@ -50,8 +55,7 @@ entry, so it starts with your next login. To start it now, run
 `owldrop-indicator &`. To try it without installing, run `./owldrop-indicator`
 from this directory.
 
-Elsewhere, install `python-gobject`, GTK 3, `libayatana-appindicator` (or
-`libappindicator`) and libnotify, then copy `owldrop-indicator` onto your PATH,
+Elsewhere, install `python-gobject`, GTK 3, libdbusmenu-gtk3 and libnotify, then copy `owldrop-indicator` onto your PATH,
 the icons into `~/.local/share/icons/hicolor/scalable/status/`, and the
 `.desktop` file into `~/.config/autostart/`.
 
@@ -63,6 +67,13 @@ the `omdrop` command for every action (`on`, `off`, `visibility`, `name`,
 reports, every 2 s while receiving and every 10 s while off, so a change
 made on the command line shows up in the menu.
 
+- **The drop-down is a window, not a menu.** An open GTK menu never grows:
+  rows added while it is open (devices, as they are found) leave it the
+  height it opened with, scrolling. So the icon is a StatusNotifierItem of
+  owldrop's own rather than an AppIndicator, which can only open a menu on a
+  left click, and the right-click menu has no rows that come and go. On
+  Wayland the drop-down can't be placed under the icon, so it opens at the
+  pointer and closes when it loses focus.
 - **Nearby devices** come from `omdrop peers --json`, which only reads the
   radio's peer table. **Look up device names** runs
   `omdrop peers --json -n --stream`. It is opt-in for the same reason as in
