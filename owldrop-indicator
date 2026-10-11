@@ -23,9 +23,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Notify", "0.7")
-gi.require_version("Dbusmenu", "0.4")
-gi.require_version("DbusmenuGtk3", "0.4")
-from gi.repository import Dbusmenu, DbusmenuGtk3, Gdk, Gio, GLib, Gtk, Notify  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Notify  # noqa: E402
 
 APP_ID = "owldrop-indicator"
 RECEIVER_UNIT = "airdrop-receiver.service"
@@ -194,7 +192,6 @@ SNI_XML = """
     <property name="AttentionIconName" type="s" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
-    <property name="Menu" type="o" access="read"/>
     <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
     <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
     <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
@@ -210,20 +207,21 @@ SNI_XML = """
 """
 SNI_PATH = "/StatusNotifierItem"
 SNI_IFACE = "org.kde.StatusNotifierItem"
-MENU_PATH = "/MenuBar"
 WATCHER = "org.kde.StatusNotifierWatcher"
 
 
 class TrayIcon:
     """The panel icon, as a StatusNotifierItem.
 
-    Implemented here rather than through AppIndicator because AppIndicator
-    marks its icon menu-only, so a left click can only ever open a GtkMenu.
-    This item is not menu-only: the tray sends a left click here as Activate
-    (with the pointer's screen position), and shows `menu` on a right click.
+    Implemented here rather than through AppIndicator because an
+    AppIndicator always has a menu, and a tray shows that menu instead of
+    telling the app about the click (XFCE's does on a left click too, when
+    "menu is primary" is set). This item publishes no menu at all, so every
+    click comes here as Activate or ContextMenu, with the pointer's screen
+    position, and opens the one drop-down.
     """
 
-    def __init__(self, menu, icon_dir, on_activate, on_secondary):
+    def __init__(self, icon_dir, on_activate, on_secondary):
         self.on_activate = on_activate
         self.on_secondary = on_secondary
         self.icon = "owldrop-indicator-off"
@@ -231,11 +229,6 @@ class TrayIcon:
         self.icon_dir = icon_dir or ""
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
-
-        # The right-click menu, served over com.canonical.dbusmenu as
-        # AppIndicator serves it: the parser follows later changes to `menu`.
-        self.menu_server = Dbusmenu.Server.new(MENU_PATH)
-        self.menu_server.set_root(DbusmenuGtk3.gtk_parse_menu_structure(menu))
 
         info = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
         # register_object_with_closures2 is GLib 2.84's name for it.
@@ -261,12 +254,12 @@ class TrayIcon:
             print(f"{APP_ID}: the tray refused the icon: {e.message}", file=sys.stderr)
 
     def _call(self, bus, sender, path, iface, method, params, invocation):
-        if method == "Activate":
+        # A right click arrives as ContextMenu on trays that pass it on (KDE's
+        # does); XFCE's keeps it for its own panel menu.
+        if method in ("Activate", "ContextMenu"):
             self.on_activate(*params.unpack())
         elif method == "SecondaryActivate":
             self.on_secondary()
-        # ContextMenu is only called by trays that cannot show dbusmenu
-        # menus themselves; Scroll has nothing to do here.
         invocation.return_value(None)
 
     def _get(self, bus, sender, path, iface, prop):
@@ -282,7 +275,6 @@ class TrayIcon:
             "AttentionIconName": GLib.Variant("s", ""),
             "ToolTip": GLib.Variant("(sa(iiay)ss)", (self.icon, [], self.title, "")),
             "ItemIsMenu": GLib.Variant("b", False),
-            "Menu": GLib.Variant("o", MENU_PATH),
         }.get(prop)
 
     def set(self, icon, title):
@@ -302,7 +294,7 @@ class TrayIcon:
 
 
 class Popup:
-    """The left-click drop-down.
+    """The drop-down that every click on the icon opens.
 
     A window of our own rather than a GtkMenu, because an open GtkMenu never
     grows: rows added while it is open, as nearby devices are found, leave it
@@ -335,8 +327,13 @@ class Popup:
             w.set_position(Gtk.WindowPosition.MOUSE)
             w.connect("focus-out-event", lambda *_: self.close())
         w.set_resizable(False)
-        w.get_style_context().add_class("popup")
-        w.get_style_context().add_class("menu")
+        # Themes draw popup windows transparent, expecting a menu inside to
+        # paint itself (Adwaita does), which leaves this one black without a
+        # compositor. Paint it as a window.
+        w.set_name("owldrop-popup")
+        css = Gtk.CssProvider()
+        css.load_from_data(b"#owldrop-popup { background-color: @theme_bg_color; }")
+        w.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         w.connect("key-press-event", self._key)
         w.connect("size-allocate", self._resized)
         self._build()
@@ -419,6 +416,10 @@ class Popup:
         for b in (self.name_btn, self.dir_btn, self.open_btn):
             foot.add(b)
         box.add(foot)
+        quit_btn = Gtk.Button(label="Quit owldrop", halign=Gtk.Align.END)
+        quit_btn.set_relief(Gtk.ReliefStyle.NONE)
+        quit_btn.connect("clicked", self._closing(ind.on_quit))
+        box.add(quit_btn)
         self.setup_btn = Gtk.Button(label="Run omdrop setup")
         self.setup_btn.connect("clicked", self._closing(ind.on_setup))
         box.add(self.setup_btn)
@@ -436,7 +437,7 @@ class Popup:
 
     def _switched(self, switch, _pspec):
         if not self.ind.updating:
-            self.ind.toggle_item.set_active(switch.get_active())
+            self.ind.set_receiving(switch.get_active())
 
     def render(self, v):
         """Bring the window in line with the indicator's view of things."""
@@ -619,15 +620,12 @@ class Indicator:
         self.updating = False       # set while syncing widgets to state, so handlers stay quiet
         self.poll_id = 0
 
-        self.build_menu()
         self.popup = Popup(self)
         here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
-        # Left click opens the drop-down, right click the menu, and a middle
-        # click toggles receiving, as it mutes in the volume applets.
-        self.tray = TrayIcon(self.menu, here if os.path.isdir(here) else None,
-                             self.popup.toggle,
-                             lambda: self.toggle_item.set_active(
-                                 not self.toggle_item.get_active()))
+        # A click opens the drop-down; a middle click toggles receiving, as it
+        # mutes in the volume applets, where the tray passes it on.
+        self.tray = TrayIcon(here if os.path.isdir(here) else None, self.popup.toggle,
+                             self.toggle_receiving)
 
         if self.cli:
             self.refresh_status()
@@ -636,82 +634,7 @@ class Indicator:
         self.render()
         GLib.timeout_add_seconds(1, self.tick)
 
-    # ------------------------------------------------------------------ menu
-
-    def build_menu(self):
-        m = self.menu = Gtk.Menu()
-
-        self.header = Gtk.MenuItem(label="AirDrop")
-        self.header.set_sensitive(False)
-        m.append(self.header)
-        self.detail = Gtk.MenuItem(label="")
-        self.detail.set_sensitive(False)
-        m.append(self.detail)
-
-        self.toggle_item = Gtk.CheckMenuItem(label="Receive files")
-        self.toggle_item.connect("toggled", self.on_toggle)
-        m.append(self.toggle_item)
-
-        self.dur_item = Gtk.MenuItem(label="Stay visible for")
-        dur_menu = Gtk.Menu()
-        self.dur_items = {}
-        group = None
-        for arg, label in DURATIONS:
-            it = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
-            group = it
-            it.connect("toggled", self.on_duration, arg)
-            dur_menu.append(it)
-            self.dur_items[arg] = it
-        self.dur_item.set_submenu(dur_menu)
-        m.append(self.dur_item)
-
-        self.vis_item = Gtk.MenuItem(label="Who can send")
-        vis_menu = Gtk.Menu()
-        self.vis_everyone = Gtk.RadioMenuItem.new_with_label_from_widget(None, "Everyone")
-        self.vis_contacts = Gtk.RadioMenuItem.new_with_label_from_widget(
-            self.vis_everyone, "Contacts only")
-        self.vis_everyone.connect("toggled", self.on_visibility, "everyone")
-        self.vis_contacts.connect("toggled", self.on_visibility, "contacts")
-        vis_menu.append(self.vis_everyone)
-        vis_menu.append(self.vis_contacts)
-        self.vis_item.set_submenu(vis_menu)
-        m.append(self.vis_item)
-
-        m.append(Gtk.SeparatorMenuItem())
-
-        # Nearby devices are listed only in the left-click drop-down: they
-        # arrive while it is open, and an open GtkMenu cannot grow to fit them.
-        self.send_item = Gtk.MenuItem(label="Send files: left-click the icon")
-        self.send_item.set_sensitive(False)
-        m.append(self.send_item)
-
-        m.append(Gtk.SeparatorMenuItem())
-
-        self.name_item = Gtk.MenuItem(label="Name…")
-        self.name_item.connect("activate", self.on_name)
-        m.append(self.name_item)
-        self.dir_item = Gtk.MenuItem(label="Save files to…")
-        self.dir_item.connect("activate", self.on_dir)
-        m.append(self.dir_item)
-        self.open_dir_item = Gtk.MenuItem(label="Open download folder")
-        self.open_dir_item.connect("activate", self.on_open_dir)
-        m.append(self.open_dir_item)
-
-        self.setup_sep = Gtk.SeparatorMenuItem()
-        m.append(self.setup_sep)
-        self.setup_item = Gtk.MenuItem(label="Run omdrop setup")
-        self.setup_item.connect("activate", self.on_setup)
-        m.append(self.setup_item)
-        self.install_item = Gtk.MenuItem(label="How to install omdrop…")
-        self.install_item.connect("activate", lambda _i: open_uri(INSTALL_URL))
-        m.append(self.install_item)
-
-        m.append(Gtk.SeparatorMenuItem())
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", self.on_quit)
-        m.append(quit_item)
-
-        m.show_all()
+    # ------------------------------------------------------------- the view
 
     def render(self):
         """Bring every widget in line with the last status. Cheap; called often."""
@@ -760,37 +683,14 @@ class Indicator:
         not_ready = self.doctor is not None and not self.doctor.get("ready")
         head, detail, icon = self.describe()
 
-        # The menu's rows stay the same from state to state, so its height
-        # does not change while it is open: an open GtkMenu cannot grow.
-        self.header.set_label(head)
-        self.detail.set_label(detail)
         self.tray.set(icon, head)
-
         controls = installed and s is not None
-        self.toggle_item.set_sensitive(controls and not self.busy)
-        self.toggle_item.set_active(receiving)
-
         want = self.settings.get("duration", "10m")
-        if want not in self.dur_items:
+        if want not in DURATION_SHORT:
             want = "10m"
-        self.dur_items[want].set_active(True)
-        self.dur_item.set_sensitive(controls)
-
         contacts = bool(s and s.get("visibility") == "contacts")
-        self.vis_item.set_sensitive(controls)
-        (self.vis_contacts if contacts else self.vis_everyone).set_active(True)
-
         name = (s or {}).get("name")
-        self.name_item.set_label(f"Name: {name}…" if name else "Name…")
-        self.name_item.set_sensitive(controls)
         d = (s or {}).get("dir")
-        self.dir_item.set_label(f"Save files to: {tildify(d)}…" if d else "Save files to…")
-        self.dir_item.set_sensitive(controls)
-        self.open_dir_item.set_sensitive(bool(d))
-
-        self.setup_sep.set_visible(not installed or not_ready)
-        self.setup_item.set_visible(installed and not_ready)
-        self.install_item.set_visible(not installed)
 
         self.popup.render(SimpleNamespace(
             head=head, detail=detail, installed=installed, controls=controls,
@@ -818,7 +718,6 @@ class Indicator:
             self.updating = True
             try:
                 _, detail, _ = self.describe()
-                self.detail.set_label(detail)
                 self.popup.detail.set_label(detail)
             finally:
                 self.updating = False
@@ -895,10 +794,14 @@ class Indicator:
 
     # -------------------------------------------------------------- receiving
 
-    def on_toggle(self, item):
-        if self.updating:
+    def toggle_receiving(self):
+        if self.cli and self.status is not None and not self.busy:
+            self.set_receiving(not self.status.get("receiving"))
+
+    def set_receiving(self, on):
+        if self.busy or on == bool(self.status and self.status.get("receiving")):
             return
-        if item.get_active():
+        if on:
             dur = self.settings.get("duration", "10m")
             self.run_busy("Turning on…", ["on", dur], "Could not turn AirDrop on")
         else:
